@@ -267,6 +267,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "GeotraserTestV-0-Info.plist";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Usamos tu ubicacion en todo momento para brindarte seguimiento seguro con mayor posibilidad de respuesta a emergencias";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Esta aplicación necesita acceso a su ubicación para guardar las coordenadas cuando agrega un elemento.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -296,6 +297,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "GeotraserTestV-0-Info.plist";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Usamos tu ubicacion en todo momento para brindarte seguimiento seguro con mayor posibilidad de respuesta a emergencias";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Esta aplicación necesita acceso a su ubicación para guardar las coordenadas cuando agrega un elemento.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
