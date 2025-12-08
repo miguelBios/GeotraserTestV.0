@@ -13,6 +13,7 @@ struct TrackingView: View {
     let userID: String
     let userDisplayName: String
     @ObservedObject var locationManager: LocationManager
+    let grupoid: String? // NEW: the user’s group id
     
     @Environment(\.openURL) private var openURL
     @Environment(\.dismiss) private var dismiss   // To go back to the first view
@@ -27,7 +28,25 @@ struct TrackingView: View {
     
     // Web view presentation
     @State private var showWeb = false
-    private let recorridoURL = URL(string: "https://navigationasistance-frontend.vercel.app/mapa.html#")!
+    
+    // Map URLs by grupoid
+    private var selectedURL: URL? {
+        guard let gid = grupoid?.lowercased(), !gid.isEmpty else { return nil }
+        switch gid {
+        case "regatas":
+            return URL(string: "https://navigationasistance-frontend.vercel.app/maparepew.html")
+        case "cavent":
+            return URL(string: "https://navigationasistance-frontend.vercel.app/mapaca1.html")
+        case "otsudan":
+            return URL(string: "https://navigationasistance-frontend.vercel.app/mapaop.html")
+        default:
+            return nil
+        }
+    }
+    
+    private var missingGroupMessage: String {
+        "No tiene actividad asignada. Por favor visite www.geotraser.com para visualizar su propio recorrido."
+    }
     
     var body: some View {
         VStack(spacing: 50) {
@@ -55,21 +74,39 @@ struct TrackingView: View {
             .buttonStyle(.bordered)
             .disabled(!isTrackingActive)
             
-            // New in-app web window
+            // In-app web window button: only enabled if we have a URL from grupoid
             Button {
                 showWeb = true
             } label: {
                 Text("Visualizar Recorrido")
             }
             .buttonStyle(.borderedProminent)
+            .disabled(selectedURL == nil)
             .sheet(isPresented: $showWeb) {
-                SafariView(url: recorridoURL)
-                    // Let the sheet take most of the screen but not all of it.
-                    // Adjust fraction if you need slightly more/less space for SOS.
-                    .presentationDetents([.fraction(0.85), .large])
-                    .presentationDragIndicator(.visible)
-                    // Keep background interactive so user can still interact with visible controls if needed.
-                    .presentationBackgroundInteraction(.enabled)
+                if let url = selectedURL {
+                    SafariView(url: url)
+                        .presentationDetents([.fraction(0.85), .large])
+                        .presentationDragIndicator(.visible)
+                        .presentationBackgroundInteraction(.enabled)
+                } else {
+                    // Safety: if somehow presented without URL, show message
+                    VStack(spacing: 16) {
+                        Text(missingGroupMessage)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                        Button("Cerrar") { showWeb = false }
+                    }
+                    .presentationDetents([.medium, .large])
+                }
+            }
+            
+            // If there is no URL (no/unknown grupoid), show the guidance message inline
+            if selectedURL == nil {
+                Text(missingGroupMessage)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
             }
             
             // SOS button (toggles emergency on/off)
@@ -179,14 +216,14 @@ struct TrackingView: View {
         locationManager.requestAlwaysAuthorizationIfNeeded()
         
         switch locationManager.authorizationStatus {
-        case .denied, .restricted:
-            statusMessage = "Permiso de ubicación denegado. Habilítelo en Configuración."
-            return
-        case .notDetermined:
-            locationManager.requestWhenInUseAuthorizationIfNeeded()
-            try? await Task.sleep(nanoseconds: 800_000_000)
-        default:
-            break
+            case .denied, .restricted:
+                statusMessage = "Permiso de ubicación denegado. Habilítelo en Configuración."
+                return
+            case .notDetermined:
+                locationManager.requestWhenInUseAuthorizationIfNeeded()
+                try? await Task.sleep(nanoseconds: 800_000_000)
+            default:
+                break
         }
         locationManager.startUpdating()
         isTrackingActive = true
@@ -403,4 +440,3 @@ private extension TrackingView {
         }
     }
 }
-

@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var locationStatusMessage: String = ""
     @State private var validationStatusMessage: String = ""
     @State private var fetchedUserName: String?
+    @State private var fetchedGrupoId: String?           // NEW: store grupoid after login
     @FocusState private var isUserIDFocused: Bool
     @FocusState private var isPasswordFocused: Bool
     
@@ -175,7 +176,8 @@ struct ContentView: View {
                             destination: TrackingView(
                                 userID: userID,
                                 userDisplayName: fetchedUserName ?? userID,
-                                locationManager: locationManager
+                                locationManager: locationManager,
+                                grupoid: fetchedGrupoId // pass grupoid
                             )
                         ) {
                             Text("Continuar")
@@ -193,6 +195,7 @@ struct ContentView: View {
                     Button(role: .destructive) {
                         // Clear session state
                         fetchedUserName = nil
+                        fetchedGrupoId = nil
                         validationStatusMessage = ""
                         locationStatusMessage = ""
                         password = ""
@@ -241,6 +244,7 @@ struct ContentView: View {
         validationStatusMessage = ""
         locationStatusMessage = ""
         fetchedUserName = nil
+        fetchedGrupoId = nil
         
         do {
             guard let user = try await fetchUser(by: userID) else {
@@ -255,8 +259,12 @@ struct ContentView: View {
                 isRequestingLocation = false
                 return
             }
-            let fullName = [user.nombre, user.apellido].joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            // Safely compose full name ignoring nil/empty apellido
+            let last = user.apellido?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = [user.nombre, (last?.isEmpty == false ? last! : nil)].compactMap { $0 }
+            let fullName = parts.joined(separator: " ")
             fetchedUserName = fullName.isEmpty ? user.nombre : fullName
+            fetchedGrupoId = user.grupoid // NEW: keep grupoid for TrackingView
             isAuthenticated = true // show logout and "Continuar" button, stay on first view
         } catch {
             validationStatusMessage = "Error validando usuario: \(error.localizedDescription)"
@@ -305,11 +313,12 @@ struct ContentView: View {
     struct Usuario: Decodable {
         let id: String
         let nombre: String
-        let apellido: String
+        let apellido: String?   // now optional to accept JSON null
         let email: String
         let password: String
         let rol: String
         let telefono: String
+        let grupoid: String?    // NEW: decode group id if present
     }
     
     // SwiftData helpers (unchanged)
