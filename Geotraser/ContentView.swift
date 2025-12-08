@@ -255,7 +255,10 @@ struct ContentView: View {
                 isRequestingLocation = false
                 return
             }
-            let fullName = [user.nombre, user.apellido].joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            // Safely compose full name ignoring nil/empty apellido
+            let last = user.apellido?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = [user.nombre, (last?.isEmpty == false ? last! : nil)].compactMap { $0 }
+            let fullName = parts.joined(separator: " ")
             fetchedUserName = fullName.isEmpty ? user.nombre : fullName
             isAuthenticated = true // show logout and "Continuar" button, stay on first view
         } catch {
@@ -305,7 +308,7 @@ struct ContentView: View {
     struct Usuario: Decodable {
         let id: String
         let nombre: String
-        let apellido: String
+        let apellido: String?   // now optional to accept JSON null
         let email: String
         let password: String
         let rol: String
