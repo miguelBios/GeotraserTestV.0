@@ -100,8 +100,18 @@ struct TrackingView: View {
                 }
             }
             
-            // If there is no URL (no/unknown grupoid), show the guidance message inline
-            if selectedURL == nil {
+            // Share button for the visualization URL
+            if let url = selectedURL {
+                ShareLink(
+                    item: url,
+                    subject: Text("Mi recorrido"),
+                    message: Text("Podés ver mi recorrido en tiempo real aquí: \(url.absoluteString)")
+                ) {
+                    Label("Compartir Recorrido", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+            } else {
+                // If there is no URL (no/unknown grupoid), show the guidance message inline
                 Text(missingGroupMessage)
                     .font(.footnote)
                     .foregroundColor(.red)
