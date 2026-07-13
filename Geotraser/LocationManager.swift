@@ -15,6 +15,7 @@ final class LocationManager: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: CLAuthorizationStatus
     @Published private(set) var lastLocation: CLLocation?
     @Published private(set) var lastError: Error?
+    @Published private(set) var heading: CLHeading?          // NEW: device compass heading
     
     override init() {
         self.authorizationStatus = manager.authorizationStatus
@@ -24,6 +25,7 @@ final class LocationManager: NSObject, ObservableObject {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
         manager.pausesLocationUpdatesAutomatically = false
+        manager.headingFilter = 1 // degrees; report heading changes >= 1°
         // We'll enable allowsBackgroundLocationUpdates only when we actually start tracking
         // to avoid unnecessary background usage before user logs in.
     }
@@ -81,6 +83,23 @@ final class LocationManager: NSObject, ObservableObject {
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
         manager.showsBackgroundLocationIndicator = false
+    }
+    
+    // MARK: - Compass heading (NEW)
+    // Uses CLLocationManager's heading updates: driven by the magnetometer, with the
+    // accelerometer used internally by CoreLocation for tilt compensation. This works
+    // even when the boat is stationary, unlike course-over-ground (which comes from GPS
+    // and needs actual movement to be meaningful).
+    func startUpdatingHeading() {
+        guard CLLocationManager.headingAvailable() else {
+            self.lastError = NSError(domain: "Location", code: 4, userInfo: [NSLocalizedDescriptionKey: "El dispositivo no tiene brújula disponible"])
+            return
+        }
+        manager.startUpdatingHeading()
+    }
+    
+    func stopUpdatingHeading() {
+        manager.stopUpdatingHeading()
     }
     
     // Async helper to await one location reading with timeout
@@ -206,5 +225,17 @@ extension LocationManager: CLLocationManagerDelegate {
             self.lastError = error
             self.delegateHandler?.onError(error)
         }
+    }
+    
+    // NEW: compass heading updates
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        Task { @MainActor in
+            self.heading = newHeading
+        }
+    }
+    
+    // Show iOS's built-in "figure-8" calibration prompt if accuracy is poor.
+    nonisolated func locationManagerShouldDisplayHeadingCalibration(_ manager: CLLocationManager) -> Bool {
+        true
     }
 }

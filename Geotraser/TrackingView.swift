@@ -26,6 +26,12 @@ struct TrackingView: View {
     @State private var secuencia: Int = 0   // sequence counter for historic posts
     @State private var isEmergencyActive: Bool = false  // Tracks SOS state
     
+    // Offline queue support
+    @StateObject private var networkMonitor = NetworkMonitor()
+    @State private var lastOfflineSampleAt: Date?
+    @State private var isSyncingOfflineQueue = false
+    @State private var pendingOfflineCount: Int = 0
+    
     // Web view presentation
     @State private var showWeb = false
     
@@ -48,39 +54,331 @@ struct TrackingView: View {
         "No tiene actividad asignada. Por favor visite www.geotraser.com para visualizar su propio recorrido."
     }
     
+    // MARK: - Speed / Heading
+    
+    // Speed over ground, from GPS, converted m/s -> knots. CLLocation reports -1 when invalid.
+    private var speedOverGroundKnots: Double? {
+        guard let loc = locationManager.lastLocation, loc.speed >= 0 else { return nil }
+        return loc.speed * 1.943844
+    }
+    
+    // Compass device heading (magnetometer, tilt-compensated by the accelerometer inside CoreLocation).
+    // Works even when the boat is stationary, unlike GPS course-over-ground.
+    private var compassHeadingDegrees: Double? {
+        guard let heading = locationManager.heading else { return nil }
+        let value = heading.trueHeading >= 0 ? heading.trueHeading : heading.magneticHeading
+        return value >= 0 ? value : nil
+    }
+    
+    // Instrument-panel dark background — high contrast, legible in bright sunlight on the water.
+    private let panelBackground = Color(red: 0.05, green: 0.09, blue: 0.14)
+    
     var body: some View {
-        VStack(spacing: 50) {
-            Image("Image")
-                .imageScale(.small)
-                .foregroundStyle(.tint)
+        ScrollView {
+            VStack(spacing: 20) {
+                Text("Usuario: \(userDisplayName)")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .padding(.top, 4)
+                
+                // MARK: Hero — this is what the sailor should see first: speed & heading,
+                // to trim the sails. While not tracking, the entry point takes this slot instead.
+                if isTrackingActive {
+                    instrumentPanel
+                } else {
+                    startPrompt
+                }
+                
+                // MARK: SOS — always available, one glance below the instruments.
+                sosButton
+                
+                Divider()
+                    .padding(.horizontal, 8)
+                
+                // MARK: Everything else — secondary controls, tucked away so they don't
+                // compete visually with speed / heading / SOS.
+                DisclosureGroup("Más opciones") {
+                    secondaryControls
+                        .padding(.top, 12)
+                }
+                .tint(.secondary)
+                .padding(.horizontal, 4)
+            }
+            .padding()
+        }
+        .onAppear {
+            locationManager.requestWhenInUseAuthorizationIfNeeded()
+            firstRecordedLocation = nil
+            Task {
+                let count = await OfflineLocationStore.shared.count
+                await MainActor.run { pendingOfflineCount = count }
+                if networkMonitor.isConnected {
+                    await flushOfflineQueueIfNeeded()
+                }
+            }
+        }
+        .onDisappear {
+            if isTrackingActive {
+                locationManager.stopUpdating()
+                locationManager.stopUpdatingHeading()
+                isTrackingActive = false
+            }
+        }
+        .onChange(of: locationManager.lastLocation) { _, newLocation in
+            guard isTrackingActive, let loc = newLocation else { return }
+            if firstRecordedLocation == nil {
+                firstRecordedLocation = loc
+            }
             
-            Text("Usuario: \(userDisplayName)")
+            // While offline — or mid-flush, so a live post can't jump ahead of the
+            // backlog and scramble the sequence numbers — buffer one sample per
+            // minute locally instead of hitting the network.
+            if !networkMonitor.isConnected || isSyncingOfflineQueue {
+                bufferOfflineSampleIfDue(location: loc)
+                return
+            }
+            
+            Task {
+                // Optional: keep real-time positions table
+                await postPosition(usuarioId: userID, latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude)
+                // Historic routes table: post EVERY update, full payload
+                await postHistoric(usuarioId: userID, location: loc)
+            }
+        }
+        .onChange(of: networkMonitor.isConnected) { _, isConnected in
+            if isConnected {
+                Task { await flushOfflineQueueIfNeeded() }
+            }
+        }
+    }
+    
+    // MARK: - Offline queue
+    
+    // Called on every GPS update while offline. Only actually stores a sample
+    // once 60s have passed since the last one, per "store positions every
+    // minute while offline".
+    private func bufferOfflineSampleIfDue(location: CLLocation) {
+        let now = Date()
+        if let last = lastOfflineSampleAt, now.timeIntervalSince(last) < 60 {
+            return
+        }
+        lastOfflineSampleAt = now
+        
+        guard let rid = recorridoID else { return } // no active recorrido yet — nothing to attach the sample to
+        
+        let sample = QueuedPosition(
+            usuarioId: userID,
+            recorridoId: rid,
+            capturedAt: now,
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude
+        )
+        
+        Task {
+            await OfflineLocationStore.shared.append(sample)
+            await MainActor.run {
+                pendingOfflineCount += 1
+                statusMessage = "Sin señal — guardando posición localmente (\(pendingOfflineCount) pendientes)."
+            }
+        }
+    }
+    
+    // Uploads everything buffered while offline, oldest first, so the
+    // recorrido's sequence numbers stay chronological. Stops at the first
+    // failure (e.g. connectivity dropped again mid-flush) and leaves the
+    // remainder queued for the next reconnect.
+    private func flushOfflineQueueIfNeeded() async {
+        guard !isSyncingOfflineQueue else { return }
+        
+        let queued = await OfflineLocationStore.shared.loadAll()
+        guard !queued.isEmpty else { return }
+        
+        isSyncingOfflineQueue = true
+        statusMessage = "Señal recuperada — subiendo \(queued.count) posiciones guardadas…"
+        
+        let ordered = queued.sorted { $0.capturedAt < $1.capturedAt }
+        var uploadedIds: Set<UUID> = []
+        
+        for point in ordered {
+            let ok = await postQueuedHistoric(point)
+            if ok {
+                uploadedIds.insert(point.id)
+                pendingOfflineCount = max(0, pendingOfflineCount - 1)
+            } else {
+                break // still offline, or a transient error — retry on the next reconnect
+            }
+        }
+        
+        if !uploadedIds.isEmpty {
+            await OfflineLocationStore.shared.remove(ids: uploadedIds)
+        }
+        
+        isSyncingOfflineQueue = false
+        statusMessage = uploadedIds.count == ordered.count
+            ? "Posiciones sincronizadas."
+            : "Sincronización parcial — se reintentará al recuperar señal."
+        
+        // Anything buffered *during* this flush (network flapping) needs its own pass.
+        if networkMonitor.isConnected {
+            let remaining = await OfflineLocationStore.shared.count
+            if remaining > 0 {
+                await flushOfflineQueueIfNeeded()
+            }
+        }
+    }
+    
+    // MARK: - Hero components
+    
+    // Big dark instrument card: SOG + heading numerals, plus a rotating compass needle.
+    private var instrumentPanel: some View {
+        VStack(spacing: 22) {
+            HStack(spacing: 0) {
+                instrumentStat(title: "VELOCIDAD",
+                                value: speedOverGroundKnots.map { String(format: "%.1f", $0) } ?? "—",
+                                unit: "kn")
+                
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(width: 1, height: 84)
+                
+                instrumentStat(title: "RUMBO",
+                                value: compassHeadingDegrees.map { String(format: "%.0f", $0) } ?? "—",
+                                unit: "°")
+            }
+            
+            ZStack {
+                Circle()
+                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    .frame(width: 76, height: 76)
+                Image(systemName: "location.north.fill")
+                    .font(.system(size: 30))
+                    .foregroundColor(.cyan)
+                    .rotationEffect(.degrees(compassHeadingDegrees ?? 0))
+                    .animation(.easeInOut(duration: 0.2), value: compassHeadingDegrees)
+            }
+            
+            if locationManager.heading == nil {
+                Text("Calibrando brújula…")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.55))
+            }
+            
+            if !networkMonitor.isConnected {
+                Label("Sin conexión — guardando posiciones", systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            } else if pendingOfflineCount > 0 {
+                Label("Subiendo \(pendingOfflineCount) posiciones pendientes…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundColor(.cyan)
+            }
+        }
+        .padding(.vertical, 28)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(panelBackground)
+        )
+    }
+    
+    private func instrumentStat(title: String, value: String, unit: String) -> some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .tracking(1.5)
+                .foregroundColor(.white.opacity(0.55))
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.system(size: 52, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundColor(.white)
+                    .minimumScaleFactor(0.6)
+                    .lineLimit(1)
+                Text(unit)
+                    .font(.title3)
+                    .foregroundColor(.white.opacity(0.6))
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+    
+    // Shown before tracking starts, in the same slot the instrument panel will occupy.
+    private var startPrompt: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "location.circle")
+                .font(.system(size: 40))
+                .foregroundColor(.white.opacity(0.7))
+            Text("Iniciá el seguimiento para ver tu velocidad y rumbo")
                 .font(.subheadline)
+                .foregroundColor(.white.opacity(0.75))
+                .multilineTextAlignment(.center)
             
-            // Start / Stop / Open Map
             Button {
                 Task { await startTracking() }
             } label: {
                 Text("Iniciar seguimiento")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(isTrackingActive)
-            
-            Button {
-                stopTrackingAndReturn()
-            } label: {
-                Text("Detener seguimiento")
+        }
+        .padding(.vertical, 28)
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(panelBackground)
+        )
+    }
+    
+    // MARK: - SOS
+    
+    private var sosButton: some View {
+        Button(role: .destructive) {
+            let nextState = !isEmergencyActive
+            Task {
+                let ok = await postEmergency(isActive: nextState)
+                if ok {
+                    await MainActor.run {
+                        isEmergencyActive = nextState
+                    }
+                }
             }
-            .buttonStyle(.bordered)
-            .disabled(!isTrackingActive)
+        } label: {
+            Text(isEmergencyActive ? "CANCELAR SOS" : "SOS")
+                .font(.title2)
+                .fontWeight(.bold)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(isEmergencyActive ? .orange : .red)
+    }
+    
+    // MARK: - Secondary controls (tucked into "Más opciones")
+    
+    private var secondaryControls: some View {
+        VStack(spacing: 16) {
+            if isTrackingActive {
+                Button {
+                    stopTrackingAndReturn()
+                } label: {
+                    Text("Detener seguimiento")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
             
-            // In-app web window button: only enabled if we have a URL from grupoid
             Button {
                 showWeb = true
             } label: {
                 Text("Visualizar Recorrido")
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.bordered)
             .disabled(selectedURL == nil)
             .sheet(isPresented: $showWeb) {
                 if let url = selectedURL {
@@ -100,7 +398,6 @@ struct TrackingView: View {
                 }
             }
             
-            // Share button for the visualization URL
             if let url = selectedURL {
                 ShareLink(
                     item: url,
@@ -108,10 +405,10 @@ struct TrackingView: View {
                     message: Text("Podés ver mi recorrido en tiempo real aquí: \(url.absoluteString)")
                 ) {
                     Label("Compartir Recorrido", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
-                // If there is no URL (no/unknown grupoid), show the guidance message inline
                 Text(missingGroupMessage)
                     .font(.footnote)
                     .foregroundColor(.red)
@@ -119,39 +416,18 @@ struct TrackingView: View {
                     .padding(.horizontal)
             }
             
-            // SOS button (toggles emergency on/off)
-            Button(role: .destructive) {
-                let nextState = !isEmergencyActive
-                Task {
-                    let ok = await postEmergency(isActive: nextState)
-                    if ok {
-                        await MainActor.run {
-                            isEmergencyActive = nextState
-                        }
-                    }
-                }
-            } label: {
-                Text(isEmergencyActive ? "Cancelar SOS" : "SOS")
-            }
-            .buttonStyle(.borderedProminent)
-            
-            // First position label
             if isTrackingActive, let first = firstRecordedLocation {
-                VStack(spacing: 6) {
-                    Text(String(format: "Tu recorrido empieza en la posición: %.6f, %.6f",
-                                first.coordinate.latitude,
-                                first.coordinate.longitude))
-                    .font(.subheadline)
-                }
+                Text(String(format: "Tu recorrido empieza en la posición: %.6f, %.6f",
+                            first.coordinate.latitude,
+                            first.coordinate.longitude))
+                .font(.footnote)
+                .multilineTextAlignment(.center)
             }
             
-            // Show recorridoID independently so it appears as soon as it’s available
             if isTrackingActive, let rid = recorridoID {
-                VStack(spacing: 6){
-                    Text("ID de recorrido: \(rid)")
-                        .font(.subheadline)
-                        .foregroundColor(.primary)
-                }
+                Text("ID de recorrido: \(rid)")
+                    .font(.footnote)
+                    .foregroundColor(.primary)
             } else if isTrackingActive, recorridoID == nil {
                 Text("Generando ID de recorrido…")
                     .font(.footnote)
@@ -164,9 +440,18 @@ struct TrackingView: View {
                     .foregroundColor(.secondary)
             }
             
-            // Diagnostics (optional)
+            if pendingOfflineCount > 0 {
+                Text("\(pendingOfflineCount) posiciones pendientes de subir")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+            
+            // Diagnostics
             VStack(spacing: 4) {
                 Text("Estado permiso: \(authDescription(locationManager.authorizationStatus))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Conexión: \(networkMonitor.isConnected ? "En línea" : "Sin conexión")")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 if let loc = locationManager.lastLocation {
@@ -176,29 +461,7 @@ struct TrackingView: View {
                 }
             }
         }
-        .padding()
-        .onAppear {
-            locationManager.requestWhenInUseAuthorizationIfNeeded()
-            firstRecordedLocation = nil
-        }
-        .onDisappear {
-            if isTrackingActive {
-                locationManager.stopUpdating()
-                isTrackingActive = false
-            }
-        }
-        .onChange(of: locationManager.lastLocation) { _, newLocation in
-            guard isTrackingActive, let loc = newLocation else { return }
-            if firstRecordedLocation == nil {
-                firstRecordedLocation = loc
-            }
-            Task {
-                // Optional: keep real-time positions table
-                await postPosition(usuarioId: userID, latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude)
-                // Historic routes table: post EVERY update, full payload
-                await postHistoric(usuarioId: userID, location: loc)
-            }
-        }
+        .font(.footnote)
     }
     
     private func authDescription(_ status: CLAuthorizationStatus) -> String {
@@ -221,6 +484,7 @@ struct TrackingView: View {
         self.secuencia = 0
         self.firstRecordedLocation = nil
         self.isEmergencyActive = false // reset SOS state on new session
+        self.lastOfflineSampleAt = nil
         
         // Handle permissions and start location updates
         locationManager.requestAlwaysAuthorizationIfNeeded()
@@ -236,6 +500,7 @@ struct TrackingView: View {
                 break
         }
         locationManager.startUpdating()
+        locationManager.startUpdatingHeading() // begin compass updates
         isTrackingActive = true
         if statusMessage.isEmpty {
             statusMessage = "Seguimiento iniciado."
@@ -248,6 +513,7 @@ struct TrackingView: View {
             return
         }
         locationManager.stopUpdating()
+        locationManager.stopUpdatingHeading() // stop compass updates
         isTrackingActive = false
         statusMessage = "Seguimiento detenido."
         
@@ -377,22 +643,15 @@ private extension TrackingView {
         return df
     }()
     
-    // Post one historic record. Always include recorrido_id so first post == rest.
-    func postHistoric(usuarioId: String, location: CLLocation) async {
-        guard let url = URL(string: "https://navigationasistance-backend-1.onrender.com/nadadorhistoricorutas/agregar") else { return }
+    // Shared historic-point poster used by both the live GPS path and the
+    // offline-queue flush, so both write through the exact same request
+    // shape and the exact same monotonically increasing `secuencia`.
+    // Returns true on a 2xx response.
+    func postHistoricPoint(usuarioId: String, recorridoId: String, timestamp: Date, latitude: Double, longitude: Double) async -> Bool {
+        guard let url = URL(string: "https://navigationasistance-backend-1.onrender.com/nadadorhistoricorutas/agregar") else { return false }
         
-        // Ensure we have a recorridoID (should be set in startTracking)
-        if recorridoID == nil {
-            await MainActor.run {
-                self.recorridoID = UUID().uuidString
-            }
-        }
-        guard let rid = recorridoID else { return }
-        
-        // Prepare common fields
-        let now = Date()
-        let fecha = Self.fechaFormatter.string(from: now) // local yyyy-MM-dd
-        let hora = Self.horaFormatter.string(from: now)   // local yyyy-MM-dd'T'HH:mm:ss.SSS
+        let fecha = Self.fechaFormatter.string(from: timestamp)
+        let hora = Self.horaFormatter.string(from: timestamp)
         
         // Increment sequence per point
         if secuencia == 0 {
@@ -404,12 +663,14 @@ private extension TrackingView {
         // Build payload: use snake_case for IDs, keep other keys per Android sample
         let payload: [String: Any] = [
             "usuario_id": usuarioId,
-            "recorrido_id": rid,
+            "recorrido_id": recorridoId,
             "nadadorfecha": fecha,
             "nadadorhora": hora,
             "secuencia": secuencia,
-            "nadadorlat": location.coordinate.latitude,
-            "nadadorlng": location.coordinate.longitude
+            "nadadorlat": latitude,
+            "nadadorlng": longitude
+            // TODO: once the backend exposes a heading field (e.g. "nadadorheading"),
+            // add it here from `compassHeadingDegrees`. Not sent yet — no endpoint support.
         ]
         
         // Log first payload
@@ -436,17 +697,51 @@ private extension TrackingView {
                 print("[POST HIST] First response status \(http.statusCode), body: \(bodyString)")
             }
             
-            if !(200...299).contains(http.statusCode) {
+            guard (200...299).contains(http.statusCode) else {
                 print("[POST HIST] Status \(http.statusCode): \(bodyString)")
-                return
+                return false
             }
-            
-            // Success: optional UI message
+            return true
+        } catch {
+            print("[POST HIST] Error: \(error.localizedDescription)")
+            return false
+        }
+    }
+    
+    // Live path: posts immediately as GPS updates arrive while online.
+    func postHistoric(usuarioId: String, location: CLLocation) async {
+        // Ensure we have a recorridoID (should be set in startTracking)
+        if recorridoID == nil {
+            await MainActor.run {
+                self.recorridoID = UUID().uuidString
+            }
+        }
+        guard let rid = recorridoID else { return }
+        
+        let ok = await postHistoricPoint(
+            usuarioId: usuarioId,
+            recorridoId: rid,
+            timestamp: Date(),
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude
+        )
+        if ok {
             await MainActor.run {
                 self.statusMessage = "Histórico enviado."
             }
-        } catch {
-            print("[POST HIST] Error: \(error.localizedDescription)")
         }
+    }
+    
+    // Offline-queue flush path: posts a buffered sample using its original
+    // capture time and recorrido id (not "now"), so the historic record stays
+    // accurate even though the upload itself happens minutes later.
+    func postQueuedHistoric(_ point: QueuedPosition) async -> Bool {
+        await postHistoricPoint(
+            usuarioId: point.usuarioId,
+            recorridoId: point.recorridoId,
+            timestamp: point.capturedAt,
+            latitude: point.latitude,
+            longitude: point.longitude
+        )
     }
 }
