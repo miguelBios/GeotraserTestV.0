@@ -134,14 +134,18 @@ struct TrackingView: View {
             // backlog and scramble the sequence numbers — buffer one sample per
             // minute locally instead of hitting the network.
             if !networkMonitor.isConnected || isSyncingOfflineQueue {
-                bufferOfflineSampleIfDue(location: loc)
+                bufferOfflineSampleIfDue(location: loc )
                 return
             }
             
             Task {
-                // Optional: keep real-time positions table
-                await postPosition(usuarioId: userID, latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude)
-                // Historic routes table: post EVERY update, full payload
+                await postPosition(
+                    usuarioId: userID,
+                    latitude: loc.coordinate.latitude,
+                    longitude: loc.coordinate.longitude,
+                    heading: compassHeadingDegrees,
+                    timestamp: Date()
+                )
                 await postHistoric(usuarioId: userID, location: loc)
             }
         }
@@ -526,14 +530,19 @@ struct TrackingView: View {
     }
     
     // MARK: - Real-time position posting (unchanged endpoint)
-    private func postPosition(usuarioId: String, latitude: Double, longitude: Double) async {
+    private func postPosition(usuarioId: String, latitude: Double, longitude: Double, heading: Double?, timestamp: Date) async {
         guard let url = URL(string: "https://navigationasistance-backend-1.onrender.com/nadadorposicion/agregar") else { return }
-        let payload: [String: Any] = [
+
+        var payload: [String: Any] = [
             "usuarioid": usuarioId,
             "nadadorlat": latitude,
-            "nadadorlng": longitude
+            "nadadorlng": longitude,
+            "fechaUltimaActualizacion": Self.actualizarFechaHoraFormatter.string(from: timestamp)
         ]
-        
+        if let heading = heading {
+            payload["bearing"] = heading ?? NSNull()
+        }
+
         do {
             let data = try JSONSerialization.data(withJSONObject: payload, options: [])
             var request = URLRequest(url: url)
@@ -541,12 +550,12 @@ struct TrackingView: View {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = data
             request.timeoutInterval = 15
-            
+
             let (_, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 print("[POST RT] Server status: \(http.statusCode)")
             } else {
-                print("[POST RT] Position sent OK")
+                print("[POST RT] Position sent OK (bearing: \(heading.map { String($0) } ?? "omitted"))")
             }
         } catch {
             print("[POST RT] Error sending position: \(error.localizedDescription)")
@@ -643,6 +652,14 @@ private extension TrackingView {
         return df
     }()
     
+    static let actualizarFechaHoraFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.calendar = Calendar(identifier: .gregorian)
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = .current
+        df.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return df
+    }()
     // Shared historic-point poster used by both the live GPS path and the
     // offline-queue flush, so both write through the exact same request
     // shape and the exact same monotonically increasing `secuencia`.
