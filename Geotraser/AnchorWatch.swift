@@ -281,13 +281,15 @@ struct AnchorWatchPanel: View {
                 pendingAnchor = nil
             }
         }
-        .confirmationDialog("¿Levantar el ancla?",
+        .confirmationDialog("¿Levar ancla?",
                             isPresented: $showRaiseConfirmation,
                             titleVisibility: .visible) {
-            Button("Desactivar alarma de fondeo", role: .destructive) { watch.disarm() }
+            Button("Levar ancla", role: .destructive) {
+                watch.disarm()   // stops siren, clears circle; tracking continues
+            }
             Button("Cancelar", role: .cancel) { }
         } message: {
-            Text("La alarma de fondeo dejará de vigilar la posición del barco.")
+            Text("Se desactivará la alarma de fondeo y seguirás navegando con el seguimiento activo.")
         }
     }
 
@@ -367,11 +369,13 @@ struct AnchorWatchPanel: View {
             Button {
                 showRaiseConfirmation = true
             } label: {
-                Text("Levantar ancla")
+                Label("Levar ancla", systemImage: "arrow.up.circle")
+                    .font(.headline)
                     .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
             }
-            .buttonStyle(.bordered)
-            .tint(.secondary)
+            .buttonStyle(.borderedProminent)
+            .tint(.cyan)
         }
     }
 
