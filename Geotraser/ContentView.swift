@@ -6,26 +6,20 @@
 //
 
 import SwiftUI
-import SwiftData
 import CoreLocation
 import Combine
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var context
-    @Environment(\.openURL) private var openURL
-    
-    @Query private var items: [DataItem]
-    
     @State private var userID: String = ""
     @State private var password: String = ""
     @State private var isPasswordVisible: Bool = false
-    
-    @StateObject private var locationManager = LocationManager()
     @State private var isRequestingLocation = false
     @State private var locationStatusMessage: String = ""
     @State private var validationStatusMessage: String = ""
     @State private var fetchedUserName: String?
     @State private var fetchedGrupoId: String?           // NEW: store grupoid after login
+    @State private var loadingMessage = "Conectando con el servidor…"
+    @StateObject private var locationManager = LocationManager()
     @FocusState private var isUserIDFocused: Bool
     @FocusState private var isPasswordFocused: Bool
     
@@ -108,7 +102,7 @@ struct ContentView: View {
                     }
                     
                     if isRequestingLocation {
-                        ProgressView("Obteniendo ubicación…")
+                        ProgressView(loadingMessage)
                     }
                     if !validationStatusMessage.isEmpty {
                         Text(validationStatusMessage)
@@ -137,79 +131,9 @@ struct ContentView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    
-                    // Keep or remove your local list
-                    List{
-                        ForEach (items){ item in
-                            HStack{
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(item.name)
-                                    if let lat = item.latitude, let lon = item.longitude {
-                                        Text(String(format: "Lat: %.6f, Lon: %.6f", lat, lon))
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    if let ts = item.timestamp {
-                                        Text(ts.formatted(date: .abbreviated, time: .standard))
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                Button{
-                                    updateItem(item)
-                                } label: {
-                                    Image(systemName: "arrow.triangle.2.circlepath")
-                                }
-                            }
-                        }
-                        .onDelete { indexes in
-                            for index in indexes {
-                                deleteItem(items[index])
-                            }
-                        }
-                    }
-                    
-                    // Visible navigation to TrackingView after authentication
-                    if isAuthenticated {
-                        NavigationLink(
-                            destination: TrackingView(
-                                userID: userID,
-                                userDisplayName: fetchedUserName ?? userID,
-                                locationManager: locationManager,
-                                grupoid: fetchedGrupoId // pass grupoid
-                            )
-                        ) {
-                            Text("Continuar")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .padding(.horizontal)
-                    }
                 }
                 
                 Spacer(minLength: 8)
-                
-                // Cerrar sesión at the bottom, only after validation
-                if isAuthenticated {
-                    Button(role: .destructive) {
-                        // Clear session state
-                        fetchedUserName = nil
-                        fetchedGrupoId = nil
-                        validationStatusMessage = ""
-                        locationStatusMessage = ""
-                        password = ""
-                        userID = ""
-                        isAuthenticated = false
-                        isPasswordVisible = false
-                        // Optionally also reset any other state here
-                    } label: {
-                        Text("Cerrar sesión")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.horizontal)
-                }
             }
             .padding(.top)
             .onAppear {
@@ -221,6 +145,16 @@ struct ContentView: View {
                     // Prefill the login ID once user is created
                     self.userID = newID
                 }
+            }
+            // NEW: successful login pushes TrackingView directly
+            .navigationDestination(isPresented: $isAuthenticated) {
+                TrackingView(
+                    userID: userID,
+                    userDisplayName: fetchedUserName ?? userID,
+                    locationManager: locationManager,
+                    grupoid: fetchedGrupoId,
+                    onLogout: logout
+                )
             }
         }
     }
@@ -273,6 +207,17 @@ struct ContentView: View {
         isRequestingLocation = false
     }
     
+    private func logout() {
+        fetchedUserName = nil
+        fetchedGrupoId = nil
+        validationStatusMessage = ""
+        locationStatusMessage = ""
+        password = ""
+        userID = ""
+        isPasswordVisible = false
+        isAuthenticated = false   // pops TrackingView
+    }
+    
     // MARK: - Networking: Fetch user by ID
     private func fetchUser(by id: String) async throws -> Usuario? {
         var base = URL(string: "https://navigationasistance-backend-1.onrender.com/usuarios/listarId/")!
@@ -320,14 +265,6 @@ struct ContentView: View {
         let telefono: String
         let grupoid: String?    // NEW: decode group id if present
     }
-    
-    // SwiftData helpers (unchanged)
-    func addItem(latitude: Double?, longitude: Double?, timestamp: Date){
-        let item = DataItem(name: userID, latitude: latitude, longitude: longitude, timestamp: timestamp)
-        context.insert(item)
-    }
-    func deleteItem(_ item:DataItem) { context.delete(item) }
-    func updateItem(_ item:DataItem){ item.name  = "Updated test item"; try? context.save() }
 }
 
 #Preview {

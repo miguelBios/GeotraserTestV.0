@@ -14,12 +14,13 @@ struct TrackingView: View {
     let userDisplayName: String
     @ObservedObject var locationManager: LocationManager
     let grupoid: String? // NEW: the user’s group id
+    let onLogout: () -> Void   // NEW: provided by ContentView
     
     @Environment(\.openURL) private var openURL
-    @Environment(\.dismiss) private var dismiss   // To go back to the first view
     
     @State private var isTrackingActive = false
     @State private var firstRecordedLocation: CLLocation?
+    @State private var showStopConfirmation = false
     
     @State private var statusMessage: String = ""
     @State private var recorridoID: String? // store the generated recorrido_id per session
@@ -31,6 +32,9 @@ struct TrackingView: View {
     @State private var lastOfflineSampleAt: Date?
     @State private var isSyncingOfflineQueue = false
     @State private var pendingOfflineCount: Int = 0
+    
+    // Anchor drift
+    @StateObject private var anchorWatch = AnchorWatch()
     
     // Web view presentation
     @State private var showWeb = false
@@ -52,6 +56,16 @@ struct TrackingView: View {
     
     private var missingGroupMessage: String {
         "No tiene actividad asignada. Por favor visite www.geotraser.com para visualizar su propio recorrido."
+    }
+    private var logoutBlockedMessage: String {
+        switch (isTrackingActive, isEmergencyActive) {
+        case (true, true):
+            return "Cancelá el SOS y detené el seguimiento para cerrar sesión."
+        case (false, true):
+            return "Cancelá el SOS para cerrar sesión."
+        default:
+            return "Detené el seguimiento para cerrar sesión."
+        }
     }
     
     // MARK: - Speed / Heading
@@ -95,6 +109,20 @@ struct TrackingView: View {
                 Divider()
                     .padding(.horizontal, 8)
                 
+                // MARK: Stop — visible only while tracking
+                if isTrackingActive {
+                    stopTrackingButton
+                }
+                
+                // MARK: Anchor button
+                if isTrackingActive {
+                    AnchorWatchPanel(watch: anchorWatch,
+                                     currentLocation: locationManager.lastLocation)
+                }
+
+                Divider()
+                    .padding(.horizontal, 8)
+                
                 // MARK: Everything else — secondary controls, tucked away so they don't
                 // compete visually with speed / heading / SOS.
                 DisclosureGroup("Más opciones") {
@@ -103,11 +131,29 @@ struct TrackingView: View {
                 }
                 .tint(.secondary)
                 .padding(.horizontal, 4)
+                // Logout only when tracking is stopped AND no SOS is active
+                if isTrackingActive || isEmergencyActive {
+                    Text(logoutBlockedMessage)
+                        .font(.caption)
+                        .foregroundColor(isEmergencyActive ? .red : .secondary)
+                        .multilineTextAlignment(.center)
+                } else {
+                    Button(role: .destructive) {
+                        onLogout()
+                    } label: {
+                        Text("Cerrar sesión")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 8)
+                }
             }
             .padding()
         }
+        .navigationBarBackButtonHidden(true)
         .onAppear {
             locationManager.requestWhenInUseAuthorizationIfNeeded()
+            anchorWatch.attach(to: locationManager)
             firstRecordedLocation = nil
             Task {
                 let count = await OfflineLocationStore.shared.count
@@ -129,7 +175,7 @@ struct TrackingView: View {
             if firstRecordedLocation == nil {
                 firstRecordedLocation = loc
             }
-            
+                
             // While offline — or mid-flush, so a live post can't jump ahead of the
             // backlog and scramble the sequence numbers — buffer one sample per
             // minute locally instead of hitting the network.
@@ -155,6 +201,7 @@ struct TrackingView: View {
             }
         }
     }
+    
     
     // MARK: - Offline queue
     
@@ -362,20 +409,39 @@ struct TrackingView: View {
         .tint(isEmergencyActive ? .orange : .red)
     }
     
+    // MARK: - Stop tracking
+
+    private var stopTrackingButton: some View {
+        Button {
+            showStopConfirmation = true
+        } label: {
+            Label("Detener seguimiento", systemImage: "stop.circle")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+        }
+        .buttonStyle(.bordered)
+        .tint(.secondary)
+        .confirmationDialog(
+            "¿Detener el seguimiento?",
+            isPresented: $showStopConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Detener seguimiento", role: .destructive) {
+                stopTracking()
+            }
+            Button("Cancelar", role: .cancel) { }
+        } message: {
+            Text(anchorWatch.isActive
+                     ? "Se dejará de enviar tu posición y se desactivará la alarma de fondeo."
+                     : "Se dejará de enviar tu posición.")
+        }
+    }
+    
     // MARK: - Secondary controls (tucked into "Más opciones")
     
     private var secondaryControls: some View {
         VStack(spacing: 16) {
-            if isTrackingActive {
-                Button {
-                    stopTrackingAndReturn()
-                } label: {
-                    Text("Detener seguimiento")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-            }
-            
             Button {
                 showWeb = true
             } label: {
@@ -511,22 +577,18 @@ struct TrackingView: View {
         }
     }
     
-    private func stopTrackingAndReturn() {
-        guard isTrackingActive else {
-            dismiss()
-            return
-        }
+    private func stopTracking() {
+        guard isTrackingActive else { return }
         locationManager.stopUpdating()
         locationManager.stopUpdatingHeading() // stop compass updates
         isTrackingActive = false
+        anchorWatch.disarm()   // NEW
         statusMessage = "Seguimiento detenido."
         
         // Notify backend to terminate tracking for this user (real-time table cleanup)
         Task {
             await postDeletePositions(usuarioId: userID)
         }
-        
-        dismiss()
     }
     
     // MARK: - Real-time position posting (unchanged endpoint)

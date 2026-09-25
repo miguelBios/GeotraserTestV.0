@@ -28,6 +28,7 @@ final class LocationManager: NSObject, ObservableObject {
         manager.headingFilter = 1 // degrees; report heading changes >= 1°
         // We'll enable allowsBackgroundLocationUpdates only when we actually start tracking
         // to avoid unnecessary background usage before user logs in.
+        manager.activityType = .otherNavigation   // boats: helps iOS tune GPS filtering
     }
     
     func requestWhenInUseAuthorizationIfNeeded() {
@@ -65,6 +66,7 @@ final class LocationManager: NSObject, ObservableObject {
     
     // Start continuous updates (supports background if capability + Always auth are granted)
     func startUpdating() {
+        wantsUpdates = true
         // Allow background updates only when tracking is active.
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
@@ -80,10 +82,12 @@ final class LocationManager: NSObject, ObservableObject {
     
     // Stop continuous updates
     func stopUpdating() {
+        wantsUpdates = false
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
         manager.showsBackgroundLocationIndicator = false
     }
+
     
     // MARK: - Compass heading (NEW)
     // Uses CLLocationManager's heading updates: driven by the magnetometer, with the
@@ -167,7 +171,8 @@ final class LocationManager: NSObject, ObservableObject {
     
     // MARK: - Internal delegate bridging
     private var delegateHandler: DelegateHandler?
-    
+    private var wantsUpdates = false   // NEW, next to delegateHandler
+
     private final class DelegateHandler {
         let onLocation: (CLLocation) -> Void
         let onError: (Error) -> Void
@@ -202,18 +207,30 @@ final class LocationManager: NSObject, ObservableObject {
             return true
         }
     }
-}
-
-extension LocationManager: CLLocationManagerDelegate {
+    
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in
             self.authorizationStatus = manager.authorizationStatus
+            // NEW: permission just granted while tracking was requested → start GPS now
+            if self.wantsUpdates,
+               manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+                self.manager.startUpdatingLocation()
+            }
         }
     }
+}
+
+extension LocationManager: CLLocationManagerDelegate {
     
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
         Task { @MainActor in
+            self.authorizationStatus = manager.authorizationStatus
+                    // NEW: permission just granted while tracking was requested → start GPS now
+                    if self.wantsUpdates,
+                       manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+                        self.manager.startUpdatingLocation()
+                    }
             self.lastLocation = loc
             self.lastError = nil
             self.delegateHandler?.onLocation(loc)
