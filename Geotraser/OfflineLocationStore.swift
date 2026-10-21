@@ -19,14 +19,18 @@ struct QueuedPosition: Codable, Identifiable {
     let capturedAt: Date
     let latitude: Double
     let longitude: Double
+    // Battery / signal at capture time. Optional so samples queued by an
+    // older build (without this field) still decode from disk.
+    let device: DeviceSnapshot?
 
-    init(usuarioId: String, recorridoId: String, capturedAt: Date, latitude: Double, longitude: Double) {
+    init(usuarioId: String, recorridoId: String, capturedAt: Date, latitude: Double, longitude: Double, device: DeviceSnapshot?) {
         self.id = UUID()
         self.usuarioId = usuarioId
         self.recorridoId = recorridoId
         self.capturedAt = capturedAt
         self.latitude = latitude
         self.longitude = longitude
+        self.device = device
     }
 }
 
