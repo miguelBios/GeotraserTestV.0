@@ -1,4 +1,12 @@
 //
+//  DeviceSnapshot.swift
+//  Geotraser
+//
+//  Created by Miguel Teperino on 21/10/26.
+//
+
+
+//
 //  DeviceTelemetry.swift
 //  GeotraserTestV.0
 //

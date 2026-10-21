@@ -33,6 +33,10 @@ struct TrackingView: View {
     @State private var isSyncingOfflineQueue = false
     @State private var pendingOfflineCount: Int = 0
     
+    // Battery / signal sent with every position
+    @State private var lastLatencyMs: Int?          // RTT of the last successful live upload
+    @State private var lastDeviceSnapshot: DeviceSnapshot?
+    
     // Anchor drift
     @StateObject private var anchorWatch = AnchorWatch()
     
@@ -153,6 +157,7 @@ struct TrackingView: View {
         .navigationBarBackButtonHidden(true)
         .onAppear {
             locationManager.requestWhenInUseAuthorizationIfNeeded()
+            DeviceTelemetry.start()
             anchorWatch.attach(to: locationManager)
             firstRecordedLocation = nil
             Task {
@@ -175,12 +180,21 @@ struct TrackingView: View {
             if firstRecordedLocation == nil {
                 firstRecordedLocation = loc
             }
+            
+            // Battery + signal read at the same instant as the fix, so both the
+            // live post and the historic point carry identical values.
+            let device = DeviceTelemetry.snapshot(
+                location: loc,
+                connectionType: networkMonitor.connectionType,
+                latencyMs: lastLatencyMs
+            )
+            lastDeviceSnapshot = device
                 
             // While offline — or mid-flush, so a live post can't jump ahead of the
             // backlog and scramble the sequence numbers — buffer one sample per
             // minute locally instead of hitting the network.
             if !networkMonitor.isConnected || isSyncingOfflineQueue {
-                bufferOfflineSampleIfDue(location: loc )
+                bufferOfflineSampleIfDue(location: loc, device: device)
                 return
             }
             
@@ -190,9 +204,10 @@ struct TrackingView: View {
                     latitude: loc.coordinate.latitude,
                     longitude: loc.coordinate.longitude,
                     heading: compassHeadingDegrees,
-                    timestamp: Date()
+                    timestamp: Date(),
+                    device: device
                 )
-                await postHistoric(usuarioId: userID, location: loc)
+                await postHistoric(usuarioId: userID, location: loc, device: device)
             }
         }
         .onChange(of: networkMonitor.isConnected) { _, isConnected in
@@ -208,7 +223,7 @@ struct TrackingView: View {
     // Called on every GPS update while offline. Only actually stores a sample
     // once 60s have passed since the last one, per "store positions every
     // minute while offline".
-    private func bufferOfflineSampleIfDue(location: CLLocation) {
+    private func bufferOfflineSampleIfDue(location: CLLocation, device: DeviceSnapshot) {
         let now = Date()
         if let last = lastOfflineSampleAt, now.timeIntervalSince(last) < 60 {
             return
@@ -222,7 +237,8 @@ struct TrackingView: View {
             recorridoId: rid,
             capturedAt: now,
             latitude: location.coordinate.latitude,
-            longitude: location.coordinate.longitude
+            longitude: location.coordinate.longitude,
+            device: device
         )
         
         Task {
@@ -524,6 +540,11 @@ struct TrackingView: View {
                 Text("Conexión: \(networkMonitor.isConnected ? "En línea" : "Sin conexión")")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                if let device = lastDeviceSnapshot {
+                    Text(device.summary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 if let loc = locationManager.lastLocation {
                     Text(String(format: "Última ubicación: %.6f, %.6f @ %@", loc.coordinate.latitude, loc.coordinate.longitude, loc.timestamp.description))
                         .font(.caption2)
@@ -592,7 +613,7 @@ struct TrackingView: View {
     }
     
     // MARK: - Real-time position posting (unchanged endpoint)
-    private func postPosition(usuarioId: String, latitude: Double, longitude: Double, heading: Double?, timestamp: Date) async {
+    private func postPosition(usuarioId: String, latitude: Double, longitude: Double, heading: Double?, timestamp: Date, device: DeviceSnapshot) async {
         guard let url = URL(string: "https://navigationasistance-backend-1.onrender.com/nadadorposicion/agregar") else { return }
 
         var payload: [String: Any] = [
@@ -602,8 +623,9 @@ struct TrackingView: View {
             "fechaUltimaActualizacion": Self.actualizarFechaHoraFormatter.string(from: timestamp)
         ]
         if let heading = heading {
-            payload["bearing"] = heading ?? NSNull()
+            payload["bearing"] = heading
         }
+        payload.merge(device.payload) { current, _ in current }
 
         do {
             let data = try JSONSerialization.data(withJSONObject: payload, options: [])
@@ -613,11 +635,15 @@ struct TrackingView: View {
             request.httpBody = data
             request.timeoutInterval = 15
 
+            let started = Date()
             let (_, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 print("[POST RT] Server status: \(http.statusCode)")
             } else {
-                print("[POST RT] Position sent OK (bearing: \(heading.map { String($0) } ?? "omitted"))")
+                // Measured round trip of this upload; travels with the next position.
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                await MainActor.run { self.lastLatencyMs = ms }
+                print("[POST RT] Position sent OK (bearing: \(heading.map { String($0) } ?? "omitted"), bateria: \(device.batteryPercent.map { String($0) } ?? "?"), red: \(device.connectionType), \(ms) ms)")
             }
         } catch {
             print("[POST RT] Error sending position: \(error.localizedDescription)")
@@ -726,7 +752,7 @@ private extension TrackingView {
     // offline-queue flush, so both write through the exact same request
     // shape and the exact same monotonically increasing `secuencia`.
     // Returns true on a 2xx response.
-    func postHistoricPoint(usuarioId: String, recorridoId: String, timestamp: Date, latitude: Double, longitude: Double) async -> Bool {
+    func postHistoricPoint(usuarioId: String, recorridoId: String, timestamp: Date, latitude: Double, longitude: Double, device: DeviceSnapshot?) async -> Bool {
         guard let url = URL(string: "https://navigationasistance-backend-1.onrender.com/nadadorhistoricorutas/agregar") else { return false }
         
         let fecha = Self.fechaFormatter.string(from: timestamp)
@@ -740,7 +766,7 @@ private extension TrackingView {
         }
         
         // Build payload: use snake_case for IDs, keep other keys per Android sample
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "usuario_id": usuarioId,
             "recorrido_id": recorridoId,
             "nadadorfecha": fecha,
@@ -751,6 +777,10 @@ private extension TrackingView {
             // TODO: once the backend exposes a heading field (e.g. "nadadorheading"),
             // add it here from `compassHeadingDegrees`. Not sent yet — no endpoint support.
         ]
+        // Battery / signal at capture time (absent for samples queued by older builds).
+        if let device {
+            payload.merge(device.payload) { current, _ in current }
+        }
         
         // Log first payload
         if secuencia == 1 {
@@ -788,7 +818,7 @@ private extension TrackingView {
     }
     
     // Live path: posts immediately as GPS updates arrive while online.
-    func postHistoric(usuarioId: String, location: CLLocation) async {
+    func postHistoric(usuarioId: String, location: CLLocation, device: DeviceSnapshot) async {
         // Ensure we have a recorridoID (should be set in startTracking)
         if recorridoID == nil {
             await MainActor.run {
@@ -802,7 +832,8 @@ private extension TrackingView {
             recorridoId: rid,
             timestamp: Date(),
             latitude: location.coordinate.latitude,
-            longitude: location.coordinate.longitude
+            longitude: location.coordinate.longitude,
+            device: device
         )
         if ok {
             await MainActor.run {
@@ -820,7 +851,8 @@ private extension TrackingView {
             recorridoId: point.recorridoId,
             timestamp: point.capturedAt,
             latitude: point.latitude,
-            longitude: point.longitude
+            longitude: point.longitude,
+            device: point.device
         )
     }
 }
